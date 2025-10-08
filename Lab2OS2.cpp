@@ -5,20 +5,20 @@
 
 // Режим потомка
 int RunChild() {
-    std::cout << "=== CHILD PROCESS ===" << std::endl;
-
+    // В потомке GetStdHandle(STD_INPUT_HANDLE) вернет дескриптор канала от родителя
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+
     int size = 0;
     DWORD bytesRead = 0;
 
-    if (!ReadFile(hStdin, &size, sizeof(size), &bytesRead, NULL) || bytesRead != sizeof(size)) {
-        std::cout << "Failed to read size" << std::endl;
+    // Читаем размер массива из канала (Pipe1)
+    if (!ReadFile(hStdin, &size, sizeof(size), &bytesRead, NULL)) {
         return 1;
     }
 
     std::vector<int> array(size);
     if (!ReadFile(hStdin, array.data(), size * sizeof(int), &bytesRead, NULL)) {
-        std::cout << "Failed to read array" << std::endl;
         return 1;
     }
 
@@ -27,13 +27,16 @@ int RunChild() {
         sum += num * num;
     }
 
-    std::cout << "Sum of squares: " << sum << std::endl;
-    return (int)sum;
+    // Записываем результат в stdout (который перенаправлен в Pipe2)
+    DWORD bytesWritten;
+    WriteFile(hStdout, &sum, sizeof(sum), &bytesWritten, NULL);
+
+    return 0;
 }
 
 // Режим родителя
 int RunParent() {
-    std::cout << "=== PARENT PROCESS ===" << std::endl;
+    std::cout << "Parent:" << std::endl;
 
     int size;
     std::cout << "Enter array size: ";
@@ -43,67 +46,93 @@ int RunParent() {
         std::cout << "Invalid size!" << std::endl;
         return 1;
     }
-
-    // Ввод элементов массива
     std::vector<int> array(size);
-    std::cout << "Enter " << size << " elements:" << std::endl;
     for (int i = 0; i < size; i++) {
         std::cin >> array[i];
     }
 
-    // Создаем каналы
-    HANDLE hReadPipe, hWritePipe;
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    HANDLE hReadFromChild, hWriteToChild;    // Pipe1: родитель -> потомок
+    HANDLE hReadFromParent, hWriteToParent;  // Pipe2: потомок -> родитель
 
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        std::cout << "CreatePipe failed!" << std::endl;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    //  Pipe1
+    if (!CreatePipe(&hReadFromChild, &hWriteToChild, &sa, 0)) {
+        std::cout << "CreatePipe1 failed!" << std::endl;
+        return 1;
+    }
+
+    //  Pipe2 
+    if (!CreatePipe(&hReadFromParent, &hWriteToParent, &sa, 0)) {
+        std::cout << "CreatePipe2 failed!" << std::endl;
+        CloseHandle(hReadFromChild);
+        CloseHandle(hWriteToChild);
         return 1;
     }
 
     // Настраиваем дочерний процесс
-    STARTUPINFOA si = { sizeof(STARTUPINFOA) };
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(STARTUPINFOA));
+    si.cb = sizeof(STARTUPINFOA);
     PROCESS_INFORMATION pi;
-    si.hStdInput = hReadPipe;
-    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
+
+    // Перенаправение ввода
+    si.hStdInput = hReadFromChild;   // Потомок читает из Pipe1
+    si.hStdOutput = hWriteToParent;  // Потомок пишет в Pipe2
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     si.dwFlags = STARTF_USESTDHANDLES;
 
     // Получаем имя текущего исполняемого файла
     char currentExe[MAX_PATH];
     GetModuleFileNameA(NULL, currentExe, MAX_PATH);
-
     std::string commandLine = std::string(currentExe) + " child";
 
     // Запускаем дочерний процесс
-    if (!CreateProcessA(
-        NULL,
-        const_cast<char*>(commandLine.c_str()),
+    if (!CreateProcessA(NULL, const_cast<char*>(commandLine.c_str()),
         NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
 
-        std::cout << "CreateProcess failed! Error: " << GetLastError() << std::endl;
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
+        std::cout << "CreateProcess failed!" << std::endl;
+        CloseHandle(hReadFromChild);
+        CloseHandle(hWriteToChild);
+        CloseHandle(hReadFromParent);
+        CloseHandle(hWriteToParent);
         return 1;
     }
 
-    CloseHandle(hReadPipe);
+    // Закрываем в родителе ненужные дескрипторы:
+    CloseHandle(hReadFromChild); 
+    CloseHandle(hWriteToParent);   
 
-    // Передаем данные
+    // Передаем данные потомку через Pipe1
     DWORD written;
+    WriteFile(hWriteToChild, &size, sizeof(size), &written, NULL);
+    WriteFile(hWriteToChild, array.data(), size * sizeof(int), &written, NULL);
 
-    WriteFile(hWritePipe, &size, sizeof(size), &written, NULL);
-    WriteFile(hWritePipe, array.data(), size * sizeof(int), &written, NULL);
-    CloseHandle(hWritePipe);
+    // Закрываем запись в Pipe1
+    CloseHandle(hWriteToChild);
 
-    // Ждем завершения
+    std::cout << "Data sent to child" << std::endl;
     WaitForSingleObject(pi.hProcess, INFINITE);
 
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    std::cout << "Child process result: " << exitCode << std::endl;
+    // Читаем результат из Pipe2
+    long long result;
+    DWORD bytesRead;
+    if (ReadFile(hReadFromParent, &result, sizeof(result), &bytesRead, NULL)) {
+        std::cout << "Result from child: " << result << std::endl;
+    }
+    else {
+        std::cout << "Failed to read result" << std::endl;
+    }
 
+    // Закрываем все дескрипторы
+    CloseHandle(hReadFromParent);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    system("pause");
 
     return 0;
 }
@@ -115,4 +144,5 @@ int main(int argc, char* argv[]) {
     else {
         return RunParent();
     }
+    system("pause");
 }
